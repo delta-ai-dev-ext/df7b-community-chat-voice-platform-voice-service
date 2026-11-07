@@ -1,0 +1,491 @@
+openapi: "3.0.3"
+info:
+  title: Voice Service API
+  version: "1.0.0"
+  description: >
+    Voice channel join/leave, capacity control, presence tracking, and LiveKit Cloud
+    integration for the Community Chat & Voice Platform. Mints short-lived LiveKit
+    participant tokens after authorization and seat reservation, tracks presence from
+    LiveKit webhooks, and enforces membership/mute state received as events.
+servers:
+  - url: /
+    description: Public ingress (service base path)
+
+tags:
+  - name: voice
+    description: Joining, leaving, and presence of voice channels
+  - name: webhooks
+    description: Inbound LiveKit webhook ingestion (signed)
+  - name: health
+    description: Liveness and readiness probes
+
+paths:
+  /voice/channels/{channel_id}/join:
+    post:
+      operationId: joinVoiceChannel
+      summary: Join a voice channel
+      description: >
+        Authorizes the caller against the community service (active membership, voice
+        channel), reserves a seat transactionally (capacity 1–10), and mints a
+        short-lived LiveKit participant token. Publishing is disabled when the member
+        is muted (listen-only). Fails closed (503) when the authorization service is
+        unavailable.
+      tags: [voice]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: channel_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinVoiceChannelRequest'
+      responses:
+        "200":
+          description: Seat reserved and participant token minted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinVoiceChannelResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not an active member of the community
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                not_a_member:
+                  value:
+                    error: not_a_member
+                    detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: The voice channel is full; alternatives with free seats are listed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceChannelFullResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /voice/channels/{channel_id}/leave:
+    post:
+      operationId: leaveVoiceChannel
+      summary: Leave a voice channel
+      description: >
+        Removes the caller from the live room (if present), frees their seat, and
+        marks them as left. Idempotent: leaving a channel the caller is not in
+        succeeds without side effects.
+      tags: [voice]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: channel_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Left (or was not present — no side effects)
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /communities/{community_id}/voice-presence:
+    get:
+      operationId: getVoicePresence
+      summary: See who is present in each voice channel
+      description: >
+        Returns one entry per voice channel of the community with participants,
+        camera/screen-share flags, and seats used out of capacity. Snapshot for
+        initial load; live updates arrive as events through the realtime gateway.
+      tags: [voice]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: community_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Voice presence per channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoicePresenceResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not an active member of the community
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                not_a_member:
+                  value:
+                    error: not_a_member
+                    detail: You are not a member of this community.
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /voice/livekit/webhooks:
+    post:
+      operationId: receiveLivekitWebhook
+      summary: LiveKit webhook ingestion
+      description: >
+        Receives LiveKit room/participant events (`participant_joined`,
+        `participant_left`, `track_published`, `track_unpublished`, `room_finished`).
+        Authenticity is verified from the signed Authorization header (API secret)
+        and body hash; events are processed idempotently by webhook event id.
+      tags: [webhooks]
+      security:
+        - livekitWebhook: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LivekitWebhookEvent'
+      responses:
+        "200":
+          description: Webhook processed (or recognized duplicate)
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          description: Missing or invalid webhook signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalid_signature:
+                  value:
+                    error: invalid_signature
+                    detail: Webhook signature verification failed.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Confirms the process is responsive. Does not fail on transient downstream dependency hiccups.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Process alive
+        "500":
+          description: Process is unrecoverable
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe
+      description: >
+        Verifies PostgreSQL and Kafka reachability. Returns 503 once graceful
+        shutdown has started so the load balancer stops routing traffic.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Ready to receive traffic
+        "503":
+          description: A critical dependency is unreachable, or shutdown has started
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Short-lived access token issued by the identity service (JWT, asymmetric
+        signature). Verified locally with the identity service's public verification
+        keys distributed through deployment configuration. Claims: sub (user_id),
+        sid (session id), email_verified, exp, iat, iss, aud.
+    livekitWebhook:
+      type: http
+      scheme: bearer
+      description: >
+        LiveKit's signed Authorization header, verified with the LiveKit API secret
+        plus body hash. Never exposed to end-user clients.
+
+  responses:
+    BadRequest:
+      description: Malformed request (invalid path parameter or body)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_body:
+              value:
+                error: invalid_request
+                detail: The request body could not be parsed.
+    Unauthorized:
+      description: Missing, invalid, or expired access token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_token:
+              value:
+                error: unauthorized
+                detail: Authentication required.
+    NotFound:
+      description: Channel or community does not exist (or is not a voice channel)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            channel_not_found:
+              value:
+                error: channel_not_found
+                detail: This voice channel does not exist.
+    InternalError:
+      description: Unexpected server error (no internal details exposed)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internal:
+              value:
+                error: internal_error
+                detail: Something went wrong. Please try again.
+    ServiceUnavailable:
+      description: Authorization dependency temporarily unavailable — fails closed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            auth_unavailable:
+              value:
+                error: voice_authorization_unavailable
+                detail: Could not verify access to the voice channel. Try again shortly.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code, snake_case.
+        detail:
+          type: string
+          description: Human-readable explanation.
+
+    JoinVoiceChannelRequest:
+      type: object
+      required: [community_id]
+      properties:
+        community_id:
+          type: string
+          format: uuid
+          description: Community that owns the voice channel.
+
+    JoinVoiceChannelResponse:
+      type: object
+      required:
+        - livekit_url
+        - token
+        - room_name
+        - can_publish_audio
+        - can_publish_video
+        - can_publish_screen
+        - token_expires_at
+      properties:
+        livekit_url:
+          type: string
+          format: uri
+          description: LiveKit Cloud endpoint the browser connects to directly.
+        token:
+          type: string
+          description: Short-lived signed LiveKit participant token (JWT). Never persisted client-side beyond the call.
+        room_name:
+          type: string
+          maxLength: 200
+          description: LiveKit room name backing the voice channel.
+        can_publish_audio:
+          type: boolean
+          description: False when the member is muted (listen-only).
+        can_publish_video:
+          type: boolean
+          description: False when the member is muted (listen-only).
+        can_publish_screen:
+          type: boolean
+          description: False when the member is muted (listen-only).
+        muted_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Non-null and in the future when the member joins listen-only.
+        token_expires_at:
+          type: string
+          format: date-time
+          description: When the participant token expires; the client re-joins to obtain a fresh token.
+
+    VoiceChannelAlternative:
+      type: object
+      required: [channel_id, name, capacity]
+      properties:
+        channel_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 10
+
+    VoiceChannelFullResponse:
+      type: object
+      required: [error, detail, alternatives]
+      properties:
+        error:
+          type: string
+          enum: [voice_channel_full]
+        detail:
+          type: string
+        alternatives:
+          type: array
+          description: Other voice channels of the community with at least one free seat; empty when none exist.
+          items:
+            $ref: '#/components/schemas/VoiceChannelAlternative'
+
+    VoicePresenceParticipant:
+      type: object
+      required: [user_id, joined_at, camera_enabled, screen_share_enabled, publishing_allowed]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        joined_at:
+          type: string
+          format: date-time
+        camera_enabled:
+          type: boolean
+        screen_share_enabled:
+          type: boolean
+        publishing_allowed:
+          type: boolean
+          description: False when the participant is muted (listen-only).
+
+    VoiceChannelPresence:
+      type: object
+      required: [channel_id, name, capacity, seats_used, participants]
+      properties:
+        channel_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 100
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 10
+        seats_used:
+          type: integer
+          minimum: 0
+          maximum: 10
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/VoicePresenceParticipant'
+
+    VoicePresenceResponse:
+      type: object
+      required: [community_id, channels]
+      properties:
+        community_id:
+          type: string
+          format: uuid
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/VoiceChannelPresence'
+
+    LivekitWebhookEvent:
+      type: object
+      description: >
+        LiveKit Cloud webhook payload. Wire shape is owned by LiveKit; this service
+        treats it as untrusted input, verifies the signature, and maps the events it
+        cares about. Shown here as the processed subset.
+      required: [event]
+      properties:
+        event:
+          type: string
+          enum:
+            - participant_joined
+            - participant_left
+            - track_published
+            - track_unpublished
+            - room_finished
+        room:
+          type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+              maxLength: 200
+        participant:
+          type: object
+          properties:
+            identity:
+              type: string
+              description: Participant identity minted into the token (user id).
+            kind:
+              type: string
+              description: Distinguishes real participants from service/agent participants.
+        track:
+          type: object
+          properties:
+            type:
+              type: string
+              description: Camera/audio track kind used to derive camera/screen-share flags.
+        id:
+          type: string
+          description: Webhook event id; deduplication key.
+        createdAt:
+          type: integer
+          format: int64
+          description: Unix nanoseconds at emit time (LiveKit wire format).

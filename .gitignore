@@ -1,4 +1,7 @@
-server/
+# The compiled binary at the repository root (`go build -o server ./cmd/server`).
+# Anchored on purpose: an unanchored `server/` also matched the cmd/server source
+# directory and kept this service's entrypoint out of version control.
+/server
 *.exe
 *.test
 *.out

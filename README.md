@@ -1,1 +1,93 @@
-# df7b-community-chat-voice-platform-voice-service
+# voice_service
+
+Voice channel service of the community/chat platform: it owns the join/leave
+lifecycle of LiveKit rooms, the seat accounting of each voice channel, the
+`voice_presence_changed` events of the platform event bus, and the reconciliation
+of local presence against the media provider.
+
+The service contract lives in `docs/` (`architecture.md`, `openapi_spec.yaml`,
+`user_stories.md`, `engineering_guide.md`, and the two ADRs); this README only
+records how the implementation is laid out and operated.
+
+## Responsibilities
+
+- `POST /voice/channels/{channel_id}/join` – authorise the caller against the
+  community service (API-002), reserve a seat transactionally, create the LiveKit
+  room (capacity backstop), and return a short-lived publishing token.
+- `POST /voice/channels/{channel_id}/leave` – idempotently disconnect the caller,
+  free the seat, and publish the leaving presence event.
+- `GET /communities/{community_id}/voice-presence` – one snapshot entry per voice
+  channel: participants, media flags, seats used, capacity.
+- `POST /voice/livekit/webhooks` – verified LiveKit callbacks (participant
+  joined/left, track published/unpublished, room finished).
+- `community_events` Kafka consumer – member removals/bans (disconnect + EVT-010),
+  in-place publish revocation on mute, channel deletion/capacity changes.
+- Reconciliation worker – diffs local presence against LiveKit and heals both
+  directions without ever mutating state when the provider is unreachable.
+
+## Layout
+
+```
+cmd/server          process wiring, graceful shutdown
+internal/config     environment parsing with defaults and fail-fast validation
+internal/handler    gin router, JWT auth, error envelope, probes, /metrics
+internal/service    join/leave/presence/webhook/consumer/reconciler orchestration,
+                    metrics, retries, readiness
+internal/livekit    LiveKit SDK adapter, token minter, webhook verifier
+internal/community  API-002 access-check client (2 s budget, one retry)
+internal/events     envelope, EVT-010/EVT-002/EVT-003 payloads, Kafka
+                    producer/consumer, trace propagation
+internal/repository PostgreSQL repositories (transactional seat reservation,
+                    presence, projections, dedupe)
+internal/models     domain and API types, error codes
+migrations          golang-migrate migrations (7 tables, embedded)
+tests/unit          behaviour tests against in-memory fakes (no infrastructure)
+tests/integration   HTTP surface tests: routing, auth, webhooks, probes, metrics
+tests/mocks         fake repositories/providers with production-like semantics
+```
+
+## Configuration
+
+Required: `DATABASE_URL`, `KAFKA_BROKERS`, `COMMUNITY_SERVICE_URL`,
+`SERVICE_TOKEN`, `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`,
+`LIVEKIT_WEBHOOK_SECRET`, `IDENTITY_JWT_PUBLIC_KEYS` (comma separated PEM,
+base64 PEM, or JWK; the token may be signed by either the current or the next
+key).
+
+Optional (defaults in parentheses): `PORT` (8080), `KAFKA_CONSUMER_GROUP`
+(voice_service), `SEAT_RESERVATION_TTL` (60s), `PARTICIPANT_TOKEN_TTL` (5m, capped),
+`COMMUNITY_CHECK_TIMEOUT` (2s), `RECONCILE_INTERVAL` (60s), `SHUTDOWN_TIMEOUT`
+(20s), `EVENT_RETENTION` (168h), `LOG_LEVEL` (info), `IDENTITY_JWT_ISSUER`,
+`IDENTITY_JWT_AUDIENCE`. See `.env.example`.
+
+## Observability
+
+`/healthz` is a liveness probe that never depends on another service, `/readyz`
+is a readiness probe over PostgreSQL and Kafka (and reports graceful shutdown),
+`/metrics` exposes the collectors of `docs/architecture.md` §6 — including
+`voice_joins_total`, `voice_participant_minutes_total`, `voice_active_participants`,
+`voice_active_rooms`, `voice_moderation_removals_total`, `http_requests_total`,
+`http_request_duration_seconds`, `kafka_consumer_lag`, and `external_call_*`.
+
+## Development
+
+```
+make install   # download modules
+make test      # go test ./... -race -count=1 -parallel 4
+make cover     # coverage of ./internal/... (gate: >= 80%)
+make lint      # golangci-lint run ./...
+make run       # go run ./cmd/server
+make build     # docker build (requires docker)
+```
+
+Migrations run at startup from the embedded `migrations` package.
+
+## Known deviation from the specification
+
+`docs/architecture.md` §4 describes the live-seat uniqueness policy as a partial
+unique index over reservations whose `expires_at` is still in the future. A
+PostgreSQL index predicate must be IMMUTABLE, so `expires_at > now()` is
+rejected by the server. The migration therefore indexes
+`seat_reservations (channel_id, user_id) WHERE released_at IS NULL` and every
+capacity query additionally filters `expires_at > now()`, sweeping expired rows
+inside the reservation transaction.

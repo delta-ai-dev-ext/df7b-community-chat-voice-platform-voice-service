@@ -1,0 +1,244 @@
+schema_version: 2
+diagram_id: voice-service
+mode: service
+orientation: LR
+scope: voice_service service view covering voice join/leave/presence, LiveKit Cloud
+  media control and webhooks, Kafka community/voice events, and PostgreSQL state.
+sources:
+- path: docs/architecture.md
+  sha256: 8f8891a26b2e0cce11e18a52f431c83cf8e2a4093205c2554c71faa3cf3a70e7
+- path: docs/decisions/ADR-001-livekit-integration.md
+  sha256: 295cf38469558c765bfd6770affca7258fe0a5e7766589b5d19a81d039a615ac
+- path: docs/decisions/ADR-002-seat-reservations.md
+  sha256: 329f5e785ee2c00d417e3ac0fd48067564ff2901a0a541371872377a8f141777
+- path: docs/openapi_spec.yaml
+  sha256: 0feb5c18a036fc5b1e03bff798f8ef27af9bd7be0e46367977830d2334601ff9
+- path: docs/user_stories.md
+  sha256: ddbf663f00e1c0113704a28f791ee75e36dd2ada84e6a9fa3b2b7fda0c40e926
+entities:
+- id: browser
+  label: Member browser clients
+  kind: annotation
+  role: inbound
+  row: 330
+  evidence:
+  - path: docs/user_stories.md
+    quote: Given I am present in a voice channel, when I leave, then I am removed
+      from the live room, my seat is freed, and my presence disappears for other members.
+- id: livekit-webhooks
+  label: LiveKit webhooks
+  kind: annotation
+  role: inbound
+  row: 470
+  evidence:
+  - path: docs/user_stories.md
+    quote: Given a webhook with a valid signed Authorization header and matching body
+      hash, when it is delivered, then it is processed idempotently by its webhook
+      event id and returns `200`.
+- id: svc
+  name: voice_service
+  label: voice_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 400
+  evidence:
+  - path: docs/architecture.md
+    quote: '`voice_service` owns everything about *being in a voice channel*:'
+- id: kafka
+  name: Kafka
+  label: Kafka event bus
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 70
+  evidence:
+  - path: docs/architecture.md
+    quote: The envelope is also mirrored into Kafka message headers (`trace_id`, `event_type`).
+- id: db
+  label: voice_service PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 330
+  evidence:
+  - path: docs/architecture.md
+    quote: All tables owned by `voice_service`; timestamps are `timestamptz`; identifiers
+      are `uuid`.
+- id: livekit
+  label: LiveKit Cloud
+  kind: annotation
+  external: true
+  external_role: dependency
+  role: outbound
+  row: 470
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Outbound LiveKit operations: create room, remove participant, update permissions
+      (revoke publish), list participants (reconciliation), delete room.'
+- id: community
+  label: community_service
+  kind: annotation
+  role: sync-only
+  row: 605
+  evidence:
+  - path: docs/architecture.md
+    quote: '| DEP-002 | `voice_service` | `community_service` | sync | `API-002` |'
+relationships:
+- id: r-browser
+  source: browser
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: join, leave and presence calls
+    exchange_id: voice-http-api
+  evidence:
+  - path: docs/user_stories.md
+    quote: when I request to join, then I receive the real-time service URL, a room
+      name matching that channel, and a short-lived participant token
+- id: r-webhooks
+  source: livekit-webhooks
+  target: svc
+  type: request
+  interaction:
+    channel: callback
+    purpose: signed participant and room webhooks
+    exchange_id: livekit-webhooks
+  evidence:
+  - path: docs/user_stories.md
+    quote: Given a webhook with a valid signed Authorization header and matching body
+      hash, when it is delivered, then it is processed idempotently by its webhook
+      event id and returns `200`.
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: All tables owned by `voice_service`; timestamps are `timestamptz`; identifiers
+      are `uuid`.
+- id: r-livekit
+  source: svc
+  target: livekit
+  type: request
+  interaction:
+    channel: direct
+    purpose: room management and participant token minting
+    protocol: LiveKit
+    exchange_id: livekit-room-api
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Outbound LiveKit operations: create room, remove participant, update permissions
+      (revoke publish), list participants (reconciliation), delete room.'
+- id: r-community
+  source: svc
+  target: community
+  type: request
+  interaction:
+    channel: direct
+    purpose: voice access check API-002
+    exchange_id: api-002-access-check
+  evidence:
+  - path: docs/architecture.md
+    quote: '`POST /internal/communities/{community_id}/channels/{channel_id}/voice-access-checks`.'
+- id: r-prod
+  source: svc
+  target: kafka
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: presence change publishing
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: voice_events
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Topic: `voice_events`. Key: `channel_id`. Consumer: `realtime_gateway`.'
+  - path: docs/architecture.md
+    quote: The envelope is also mirrored into Kafka message headers (`trace_id`, `event_type`).
+- id: r-cons
+  source: kafka
+  target: svc
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: community membership and channel reactions
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: community_events
+  evidence:
+  - path: docs/architecture.md
+    quote: Consume `community_events` (EVT-002/003); maintain projections; trigger
+      removals and room closures.
+  - path: docs/architecture.md
+    quote: The envelope is also mirrored into Kafka message headers (`trace_id`, `event_type`).
+view:
+  entities:
+  - browser
+  - livekit-webhooks
+  - svc
+  - kafka
+  - db
+  - livekit
+  - community
+  groups: []
+  edges:
+  - id: e-browser
+    source: browser
+    target: svc
+    relationships:
+    - r-browser
+    label: join / leave / presence
+    flow: forward
+  - id: e-webhooks
+    source: livekit-webhooks
+    target: svc
+    relationships:
+    - r-webhooks
+    label: signed webhooks
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-livekit
+    source: svc
+    target: livekit
+    relationships:
+    - r-livekit
+    label: LiveKit server SDK
+    flow: forward
+  - id: e-community
+    source: svc
+    target: community
+    relationships:
+    - r-community
+    label: API-002 access check
+    flow: forward
+  - id: e-prod
+    source: svc
+    target: kafka
+    relationships:
+    - r-prod
+    label: 'Producers
+
+      voice_service:voice_events'
+    flow: forward
+  - id: e-cons
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons
+    label: 'Consumers
+
+      voice_service:community_events'
+    flow: feedback
+  omitted: []
